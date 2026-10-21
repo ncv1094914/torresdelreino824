@@ -297,6 +297,7 @@ body.halloween .result-title.win{color:#ff9a2a;text-shadow:0 4px 0 #6b2a00,0 0 2
 @keyframes spiderSwing{0%{transform:rotate(-8deg) scaleY(.85)}100%{transform:rotate(8deg) scaleY(1.1)}}
 .hw-pumpkin{width:84px;height:70px;margin:0 auto 2px;filter:drop-shadow(0 0 16px rgba(255,140,30,.6))}
 </style>
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js" onerror="var f=document.createElement('script');f.src='https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js';document.head.appendChild(f)"></script>
 </head>
 <body>
 
@@ -360,6 +361,7 @@ body.halloween .result-title.win{color:#ff9a2a;text-shadow:0 4px 0 #6b2a00,0 0 2
     <div id="menuDeckMeta" class="menu-deck-meta"></div>
     <button class="btn play" id="btnPlay">JUGAR</button>
     <button class="btn red" id="btnTwo">2 JUGADORES · PANTALLA DIVIDIDA</button>
+    <button class="btn blue" id="btnOnline">🌐 MULTIJUGADOR ONLINE · P2P</button>
     <div class="row2">
       <button class="btn blue small" id="btnDeck">Editar mazos</button>
       <button class="btn blue small" id="btnHelp">Cómo jugar</button>
@@ -376,6 +378,25 @@ body.halloween .result-title.win{color:#ff9a2a;text-shadow:0 4px 0 #6b2a00,0 0 2
         <li>Pulsa 😀 (o <kbd>R</kbd>) para enviar una reacción. <kbd>Esc</kbd>: pausa.</li>
       </ul>
     </div>
+  </div>
+</div>
+
+<!-- Sala online PeerJS -->
+<div id="onlineSetup" class="overlay">
+  <div class="panel wide">
+    <h2 class="title small">MULTIJUGADOR ONLINE</h2>
+    <p class="subtitle">Crea una sala y comparte el código de 6 caracteres con tu rival. No hace falta una cuenta.</p>
+    <button class="btn play" id="btnOnlineCreate">CREAR SALA</button>
+    <div class="row2" style="align-items:center;gap:8px;margin:12px 0">
+      <input id="onlineCode" maxlength="6" autocomplete="off" autocapitalize="characters" placeholder="CÓDIGO" aria-label="Código de sala" style="min-width:0;width:100%;text-align:center;text-transform:uppercase;font-size:1.2rem;letter-spacing:.25em;padding:12px;border-radius:10px;border:2px solid #52617d;background:#10182a;color:#fff">
+      <button class="btn blue" id="btnOnlineJoin">UNIRSE</button>
+    </div>
+    <div id="onlineStatus" role="status" style="min-height:2.5em;text-align:center;white-space:pre-wrap"></div>
+    <div id="onlineRoom" class="hidden" style="text-align:center;padding:10px;background:#10182a;border-radius:12px;margin:10px 0">
+      <div style="font-size:.8rem;opacity:.8">CÓDIGO DE LA SALA</div><div id="onlineRoomCode" style="font-size:2rem;font-weight:900;letter-spacing:.3em;color:#ffd54a;margin:5px 0"></div>
+      <button class="btn blue small" id="btnOnlineCopy">COPIAR CÓDIGO</button>
+    </div>
+    <button class="btn blue small" id="btnOnlineBack">Volver al menú</button>
   </div>
 </div>
 
@@ -446,7 +467,7 @@ body.halloween .result-title.win{color:#ff9a2a;text-shadow:0 4px 0 #6b2a00,0 0 2
 
 <script>
 /* =========================================================
-   TORRES DEL REINO — juego de estrategia en tiempo real
+   TORRES DEL REINO — juego de estrategia en tiempo real + multijugador PeerJS
    Índice del código:
      1. Configuración y datos de cartas
      2. Utilidades
@@ -1065,6 +1086,216 @@ function loadDeck(key) { const d = load(key); return deckIsValid(d) ? d : DEFAUL
 const decks = [loadDeck('tdr_deck'), loadDeck('tdr_deck2')];          // mazo del Jugador 1 y del Jugador 2
 const cursors = [{ x: 9, y: 22, active: false }, { x: 9, y: 10, active: false }];   // cursores de teclado
 
+/* Red online: el anfitrión es la autoridad; el invitado solo envía órdenes y dibuja snapshots. */
+let net = { role: 'offline', peer: null, conn: null, code: '', ready: false, lastSync: 0, lastDeck: '', pendingDeck: null, timeout: null };
+let onlineTeam = 0;
+function netStatus(msg) { const el = $('onlineStatus'); if (el) el.textContent = msg; }
+function netButtons(enabled) { $('btnOnlineCreate').disabled = !enabled; $('btnOnlineJoin').disabled = !enabled; }
+function netClearTimeout() { if (net.timeout) { clearTimeout(net.timeout); net.timeout = null; } }
+function peerErrorText(err, stage) {
+  const type = err && err.type ? err.type : 'error-desconocido';
+  if (type === 'unavailable-id') return 'Este código ya está ocupado. Vuelve a crear la sala.';
+  if (type === 'peer-unavailable') return 'No se encuentra esa sala. Comprueba el código y que el anfitrión siga dentro.';
+  if (type === 'network' || type === 'socket-error' || type === 'socket-closed') return 'No se pudo contactar con el servidor de conexión. Revisa Internet o prueba otra red.';
+  if (type === 'webrtc' || type === 'negotiation-failed') return 'El navegador no pudo establecer la conexión directa. La red puede estar bloqueando WebRTC.';
+  if (type === 'browser-incompatible') return 'Este navegador no admite las funciones necesarias. Actualiza Chrome e inténtalo otra vez.';
+  if (type === 'server-error') return 'El servidor gratuito de conexión no respondió correctamente. Espera un momento y reintenta.';
+  return 'Falló la conexión (' + type + (stage ? ', ' + stage : '') + '). Vuelve a intentarlo.';
+}
+function netFail(msg) {
+  netClearTimeout();
+  netStatus(msg);
+  netButtons(true);
+}
+function makePeerOptions() {
+  // STUN descubre rutas directas; TURN permite retransmitir si la red bloquea la conexión directa.
+  return { debug: 2, config: { iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'turn:eu-0.turn.peerjs.com:3478', username: 'peerjs', credential: 'peerjsp' },
+    { urls: 'turn:us-0.turn.peerjs.com:3478', username: 'peerjs', credential: 'peerjsp' }
+  ], sdpSemantics: 'unified-plan' } };
+}
+function netArmTimeout(message, ms = 15000) {
+  netClearTimeout();
+  net.timeout = setTimeout(() => {
+    if (!net.ready) netFail(message);
+  }, ms);
+}
+function netClose() {
+  const old = net; net = { role: 'offline', peer: null, conn: null, code: '', ready: false, lastSync: 0, lastDeck: '', pendingDeck: null, timeout: null };
+  if (old.timeout) clearTimeout(old.timeout);
+  try { if (old.conn) old.conn.close(); } catch (_) {}
+  try { if (old.peer) old.peer.destroy(); } catch (_) {}
+}
+function makeSnapshot() {
+  if (!G) return null;
+  return JSON.stringify(G, (key, value) => {
+    if (key === 'target' || key === 'charmBy') return null; // referencias a entidades
+    if (key === 'ai') return [null, null];                 // la IA nunca se ejecuta en online
+    if (key === 'pending') return [];                      // las funciones pendientes no se serializan
+    if (typeof value === 'function') return undefined;
+    return value;
+  });
+}
+function netSend(obj) { try { if (net.conn && net.conn.open) net.conn.send(obj); } catch (e) { console.warn('PeerJS send:', e); } }
+function netBroadcast() {
+  if (net.role !== 'host' || !net.conn || !net.conn.open || !G) return;
+  const data = makeSnapshot(); if (data) netSend({ type: 'snapshot', data });
+}
+function applySnapshot(raw) {
+  try {
+    const next = JSON.parse(raw);
+    const old = G;
+    const selected = old && old.players && old.players[onlineTeam] ? old.players[onlineTeam].selected : -1;
+    const oldHand = old && old.players && old.players[onlineTeam] ? old.players[onlineTeam].hand.join('|') : '';
+    G = next; G.ai = [null, null]; G.pending = [];
+    if (G.players[onlineTeam]) G.players[onlineTeam].selected = selected;
+    const newHand = G.players[onlineTeam].hand.join('|');
+    if (oldHand !== newHand) renderHand(onlineTeam);
+    else { updateHandState(onlineTeam); updateCardInfo(onlineTeam); }
+    if (appState === 'playing' && G.over && G.endTimer <= 0) showEnd();
+  } catch (e) { console.warn('Snapshot online inválido:', e); }
+}
+function setupOnlineConnection(conn, role) {
+  net.conn = conn; net.role = role;
+  conn.on('open', () => {
+    netClearTimeout();
+    net.ready = true;
+    netButtons(true);
+    if (role === 'guest') {
+      onlineTeam = 1;
+      conn.send({ type: 'join', deck: decks[0] });
+      netStatus('Conectado. Esperando a que el anfitrión inicie la partida…');
+    } else {
+      netStatus('Rival conectado. ¡Partida lista!');
+      netBroadcast();
+    }
+  });
+  conn.on('data', msg => {
+    if (!msg || typeof msg !== 'object') return;
+    if (role === 'host') {
+      if (msg.type === 'join') {
+        if (Array.isArray(msg.deck) && msg.deck.length === 8 && msg.deck.every(id => CARDS[id])) {
+          if (G && G.players) G.players[1] = makePlayer(1, msg.deck);
+          else net.pendingDeck = msg.deck.slice();
+        }
+        netBroadcast();
+      } else if (msg.type === 'play' && G && !G.over && Number.isInteger(msg.index) && msg.index >= 0 && msg.index < 4 && Number.isFinite(msg.x) && Number.isFinite(msg.y)) {
+        const result = playCard(1, msg.index, clamp(msg.x, 0, COLS), clamp(msg.y, 0, ROWS));
+        if (result !== 'ok') netSend({ type: 'reject', reason: result });
+        else { G.players[1].selected = -1; netBroadcast(); }
+      } else if (msg.type === 'emote' && Number.isInteger(msg.index)) {
+        if (G && msg.index >= 0 && msg.index < EMOTES.length) sendEmote(1, msg.index);
+      } else if (msg.type === 'rematch') {
+        startOnlineMatch('host');
+      }
+    } else {
+      if (msg.type === 'snapshot' && typeof msg.data === 'string') {
+        netClearTimeout();
+        if (!G || G.mode !== 'online' || appState !== 'playing') startOnlineMatch('guest');
+        applySnapshot(msg.data);
+        netStatus('Partida conectada y sincronizada. ¡A jugar!');
+      }
+      else if (msg.type === 'reject') {
+        const reason = msg.reason === 'elixir' ? '¡Elixir insuficiente!' : msg.reason === 'limit' ? 'Demasiadas tropas en el campo' : 'No puedes colocar la carta aquí';
+        showToast(reason, 1); SFX.play('error');
+      }
+    }
+  });
+  conn.on('close', () => { net.ready = false; netClearTimeout(); netFail('La conexión se cerró. Vuelve al menú y crea otra sala o vuelve a unirte.'); if (net.role === 'guest') showToast('Conexión perdida', 1); });
+  conn.on('error', err => { console.warn('PeerJS connection:', err); netFail(peerErrorText(err, 'canal de datos')); });
+}
+function createOnlineRoom() {
+  if (typeof Peer === 'undefined') { netFail('No se pudo cargar PeerJS. Comprueba Internet y recarga la página.'); return; }
+  netClose(); onlineTeam = 0;
+  netButtons(false);
+  netStatus('Conectando con el servidor gratuito…');
+  netArmTimeout('El servidor de conexión tardó demasiado. Recarga la página o inténtalo de nuevo.', 15000);
+  const code = Math.random().toString(36).slice(2, 8).toUpperCase().padEnd(6, 'X').slice(0, 6);
+  let peer;
+  try { peer = new Peer('tdrroom' + code, makePeerOptions()); }
+  catch (err) { netFail('No se pudo iniciar PeerJS: ' + (err.message || err)); return; }
+  net.peer = peer; net.code = code;
+  peer.on('open', id => {
+    netClearTimeout();
+    $('onlineRoom').classList.remove('hidden'); $('onlineRoomCode').textContent = code;
+    netStatus('Sala creada. Comparte el código y deja esta pestaña abierta.');
+    netButtons(true);
+    peer.on('connection', conn => {
+      if (net.conn && net.conn.open) { conn.close(); return; }
+      netArmTimeout('El rival tardó demasiado en conectar. Comprueba el código e inténtalo otra vez.', 20000);
+      setupOnlineConnection(conn, 'host');
+      conn.on('open', () => {
+        if (net.conn !== conn) return;
+        if (!G || G.mode !== 'online') startOnlineMatch('host');
+      });
+    });
+  });
+  peer.on('error', err => {
+    console.warn('PeerJS room:', err);
+    netFail(peerErrorText(err, 'crear sala'));
+    if (err && err.type === 'unavailable-id') { try { peer.destroy(); } catch (_) {} net.peer = null; }
+  });
+  peer.on('disconnected', () => { if (net.peer === peer) netStatus('Se perdió el servidor de señalización. La partida puede seguir si ya estaba conectada; recarga si no puedes crear otra sala.'); });
+}
+function joinOnlineRoom() {
+  if (typeof Peer === 'undefined') { netFail('No se pudo cargar PeerJS. Comprueba Internet y recarga la página.'); return; }
+  const code = $('onlineCode').value.trim().toUpperCase();
+  if (!/^[A-Z0-9]{6}$/.test(code)) { netStatus('Introduce un código válido de 6 caracteres.'); return; }
+  netClose(); onlineTeam = 1;
+  netButtons(false); netStatus('Conectando con el servidor y buscando la sala ' + code + '…');
+  netArmTimeout('Se agotó el tiempo de conexión. Comprueba que el anfitrión siga en la sala y prueba otra vez.', 20000);
+  let peer;
+  try { peer = new Peer(undefined, makePeerOptions()); }
+  catch (err) { netFail('No se pudo iniciar PeerJS: ' + (err.message || err)); return; }
+  net.peer = peer; net.code = code;
+  peer.on('open', () => {
+    netStatus('Servidor encontrado. Conectando con el anfitrión…');
+    const conn = peer.connect('tdrroom' + code, { reliable: true, serialization: 'json' });
+    setupOnlineConnection(conn, 'guest');
+    // No iniciar aún: esperamos el primer snapshot del anfitrión para evitar dibujar un estado vacío.
+    conn.on('open', () => {
+      netStatus('Conexión establecida. Esperando el estado inicial de la partida…');
+      netClearTimeout();
+      net.timeout = setTimeout(() => {
+        if (net.role === 'guest' && (!G || G.mode !== 'online')) netFail('Se conectó el canal, pero no llegó la partida. Pide al anfitrión que cree una sala nueva e inténtalo otra vez.');
+      }, 12000);
+    });
+  });
+  peer.on('error', err => {
+    console.warn('PeerJS join:', err);
+    netFail(peerErrorText(err, 'unirse a sala'));
+  });
+  peer.on('disconnected', () => { if (net.peer === peer) netStatus('Se perdió el servidor de señalización durante la conexión.'); });
+}
+function startOnlineMatch(role) {
+  onlineTeam = role === 'guest' ? 1 : 0;
+  if (role === 'host') {
+    newGame({ mode: 'online' });
+    G.ai = [null, null];
+    if (Array.isArray(net.pendingDeck) && net.pendingDeck.length === 8 && net.pendingDeck.every(id => CARDS[id])) {
+      G.players[1] = makePlayer(1, net.pendingDeck); net.pendingDeck = null;
+    }
+  }
+  appState = 'playing'; lastMode = 'online';
+  hideOverlays();
+  for (const p of P) closeEmotes(p.team);
+  ptrs.clear(); held.clear(); mouseHover = null;
+  UI.lastCrowns = ''; UI.lastTimer = '';
+  setLayout('online');
+  // El panel propio ocupa la única vista en pantalla, incluso para el invitado.
+  $('view0').appendChild(P[onlineTeam].root);
+  if (onlineTeam === 0) $('view1').appendChild(P[1].root); else $('view1').appendChild(P[0].root);
+  const lab = $('view0').querySelector('.vlabel');
+  if (lab) lab.innerHTML = `<span class="tag" style="background:${onlineTeam ? '#c9302c' : '#2f6fe0'}">${onlineTeam ? 'JUGADOR 2' : 'JUGADOR 1'}</span><span>Elige una carta y colócala en tu mitad · Teclas 1–4 · Espacio · Reacción R</span>`;
+  $('labelP').textContent = onlineTeam ? 'Tú · Jugador 2' : 'Tú · Jugador 1';
+  $('labelE').textContent = onlineTeam ? 'Rival · Jugador 1' : 'Rival · Jugador 2';
+  if (role === 'host') { renderHands(); netBroadcast(); netStatus('Partida iniciada. ¡Buena suerte!'); }
+  else netStatus('Conectado. Sincronizando partida…');
+  resize(); SFX.play('fight'); Music.stop(); Music.play('battle');
+}
+
+
 function makePlayer(team, deckIds) {
   const deck = shuffle(deckIds.slice());
   return { team, deck: deckIds.slice(), elixir: ELIXIR_START, hand: deck.slice(0, 4), queue: deck.slice(4), selected: -1 };
@@ -1080,7 +1311,7 @@ function newGame(opts = {}) {
     fires: [],
     crowns: [0, 0], shake: 0, endTimer: -1, result: null,
     emotes: [], emoteQueue: [], emoteCd: [0, 0],
-    ai: [opts.autoPlayer ? new AI(0, AUTOTEST_DIFF) : null, opts.mode === '2p' ? null : new AI(1, aiDifficulty())]
+    ai: [opts.autoPlayer ? new AI(0, AUTOTEST_DIFF) : null, (opts.mode === '2p' || opts.mode === 'online') ? null : new AI(1, aiDifficulty())]
   };
   // la IA genera elixir más rápido (o más lento) según la dificultad
   if (G.ai[1]) G.players[1].elixirMult = G.ai[1].diff.elixir;
@@ -2054,7 +2285,7 @@ class AI {
    ========================================================= */
 /* Una vista por jugador; la del Jugador 2 está girada 180° para que vea sus torres abajo */
 const VIEWS = [0, 1].map(team => { const canvas = $('arena' + team); return { team, flip: team === 1, canvas, ctx: canvas.getContext('2d'), wrap: $('view' + team) }; });
-function activeViews() { return G && G.mode === '2p' ? VIEWS : [VIEWS[0]]; }
+function activeViews() { if (G && G.mode === '2p') return VIEWS; if (G && G.mode === 'online') { VIEWS[0].team = onlineTeam; VIEWS[0].flip = onlineTeam === 1; return [VIEWS[0]]; } VIEWS[0].team = 0; VIEWS[0].flip = false; return [VIEWS[0]]; }
 let S = 20, DPR = 1, bgCanvas = null, animTime = 0, FLIP = false;
 let THEME = load('tdr_theme') || 'halloween';       // tema visual: 'halloween' (por defecto) o 'classic'
 /* Coloca un marco local "derecho" en (x, y): en la vista girada se contrarresta el giro */
@@ -3311,7 +3542,7 @@ function updateCardInfo(team) {
     : '<span class="hint">Elige una carta y suéltala en tu mitad de la arena (ratón, o cursor <b>WASD</b> + <b>Espacio</b>).</span>';
 }
 
-function activeTeams() { return G && G.mode === '2p' ? [0, 1] : [0]; }
+function activeTeams() { return G && G.mode === '2p' ? [0, 1] : G && G.mode === 'online' ? [onlineTeam] : [0]; }
 
 function updateHUD() {
   if (!G) return;
@@ -3324,14 +3555,15 @@ function updateHUD() {
   $('timerBox').classList.toggle('double', G.double);
   $('timerBox').classList.toggle('low', t <= 10);
   $('timerLabel').textContent = G.double ? 'Doble elixir' : 'Tiempo';
-  const ck = G.crowns.join(',') + G.mode;
+  const ck = G.crowns.join(',') + G.mode + (G.mode === 'online' ? onlineTeam : '');
   if (ck !== UI.lastCrowns) {
     UI.lastCrowns = ck;
-    for (const [elId, n] of [['crownsP', G.crowns[0]], ['crownsE', G.crowns[1]]]) {
+    const ownTeam = G.mode === 'online' ? onlineTeam : 0, enemyTeam = 1 - ownTeam;
+    for (const [elId, n] of [['crownsP', G.crowns[ownTeam]], ['crownsE', G.crowns[enemyTeam]]]) {
       $(elId).innerHTML = [0, 1, 2].map(i => CROWN_SVG.replace('class="crown"', `class="crown${i < n ? ' on' : ''}"`)).join('');
     }
-    $('labelP').textContent = G.mode === '2p' ? 'J1' : 'Tú';
-    $('labelE').textContent = G.mode === '2p' ? 'J2' : 'Rival';
+    $('labelP').textContent = G.mode === '2p' ? 'J1' : G.mode === 'online' ? (onlineTeam ? 'Tú · J2' : 'Tú · J1') : 'Tú';
+    $('labelE').textContent = G.mode === '2p' ? 'J2' : G.mode === 'online' ? (onlineTeam ? 'Rival · J1' : 'Rival · J2') : 'Rival';
   }
   for (const team of activeTeams()) {
     const p = P[team], el = G.players[team].elixir;
@@ -3347,7 +3579,7 @@ function restartAnim(el, cls) { el.classList.remove(cls); void el.offsetWidth; e
 function viewIndex(team) { return G && G.mode === '2p' ? team : 0; }
 const toastTimers = [0, 0];
 function showToast(msg, team = 0) {
-  if (G && G.mode !== '2p' && team !== 0) return;
+  if (G && G.mode !== '2p' && G.mode !== 'online' && team !== 0) return;
   const i = viewIndex(team), t = VIEWS[i].wrap.querySelector('.toast');
   t.textContent = msg; t.classList.add('show');
   clearTimeout(toastTimers[i]); toastTimers[i] = setTimeout(() => t.classList.remove('show'), 1300);
@@ -3390,6 +3622,7 @@ function highlightEmote(team) {
   const p = P[team]; [...p.pop.children].forEach((b, i) => b.classList.toggle('sel', i === p.emoteSel));
 }
 function sendEmote(team, i) {
+  if (G && G.mode === 'online' && net.role === 'guest') { netSend({ type: 'emote', index: i }); return; }
   if (!G || appState !== 'playing') return;
   const now = performance.now();
   if (now - (G.emoteCd[team] || 0) < 1500) return;          // evita el spam
@@ -3397,7 +3630,7 @@ function sendEmote(team, i) {
   G.emotes = G.emotes.filter(e => e.team !== team);
   G.emotes.push({ team, i, t: 0, dur: 2.6 });
   SFX.play('emote', team === 0 || G.mode === '2p' ? 1 : 0.7);
-  if (G.mode !== '2p' && team === 0 && Math.random() < 0.4) aiEmote(pick([4, 7, 1, 0, 5]), 1.2 + Math.random());
+  if (G.mode === 'ai' && team === 0 && Math.random() < 0.4) aiEmote(pick([4, 7, 1, 0, 5]), 1.2 + Math.random());
 }
 function aiEmote(i, delay) { if (G && G.mode !== '2p') G.emoteQueue.push({ i, delay }); }
 function updateEmotes(dt) {
@@ -3508,6 +3741,10 @@ function attemptPlace(team, x, y) {
   if (i < 0) return;
   const id = pl.hand[i], card = CARDS[id];
   if (card.type !== 'spell') { x = snap(x); y = snap(y); }
+  if (G.mode === 'online' && net.role === 'guest') {
+    if (!net.ready) { showToast('Todavía no hay conexión con el anfitrión', team); return; }
+    netSend({ type: 'play', index: i, x, y }); pl.selected = -1; updateHandState(team); updateCardInfo(team); return;
+  }
   const res = playCard(team, i, x, y);
   if (res === 'ok') { pl.selected = -1; renderHand(team, i); flashSpend(team, card.cost); }
   else if (res === 'elixir') { showToast('¡Elixir insuficiente!', team); SFX.play('error'); }
@@ -3554,11 +3791,11 @@ function keyAction(code) {
   }
   return null;
 }
-function teamOfSet(set) { return G && G.mode === '2p' ? set : 0; }   // contra la IA ambos juegos de teclas mueven al jugador
+function teamOfSet(set) { return G && G.mode === '2p' ? set : G && G.mode === 'online' ? onlineTeam : 0; }   // contra la IA ambos juegos de teclas mueven al jugador
 
 window.addEventListener('keydown', e => {
   if (e.code === 'Escape' || (e.code === 'KeyP' && !e.repeat)) {
-    if (appState === 'playing' && !G.over) { G.paused ? resumeGame() : pauseGame(); e.preventDefault(); }
+    if (appState === 'playing' && !G.over && !(G.mode === 'online' && net.role === 'guest')) { G.paused ? resumeGame() : pauseGame(); e.preventDefault(); }
     return;
   }
   if (appState !== 'playing') return;
@@ -3608,7 +3845,7 @@ function updateCursors(dt) {
   }
 }
 
-document.addEventListener('visibilitychange', () => { if (document.hidden && appState === 'playing' && G && !G.over && !G.paused && !AUTOTEST) pauseGame(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden && appState === 'playing' && G && !G.over && !G.paused && !AUTOTEST && !(G.mode === 'online' && net.role === 'guest')) pauseGame(); });
 document.addEventListener('click', e => { if (e.target.closest('.btn')) SFX.play('click'); });
 
 /* ---------- Editor de mazos (uno por jugador) ---------- */
@@ -3673,7 +3910,8 @@ $('btnDeckDone').addEventListener('click', () => { $('deckEditor').classList.rem
 function hideOverlays() { for (const id of ['menu', 'pauseMenu', 'endScreen', 'deckEditor', 'twoSetup']) $(id).classList.remove('show'); }
 function setLayout(mode) {
   $('game').classList.toggle('two', mode === '2p');
-  $('view1').classList.toggle('hidden', mode !== '2p');
+  $('view1').classList.toggle('hidden', mode !== '2p' && mode !== 'online');
+  if (mode === 'online') $('view1').classList.add('hidden');
   resize();
 }
 let lastMode = 'ai';
@@ -3695,9 +3933,11 @@ function startGame(mode = lastMode) {
   if (mode !== '2p' && !AUTOTEST) { const d = G.ai[1].diff; showBanner(`Dificultad: ${d.name}`, d.color); }
   Music.stop(); Music.play('battle');
 }
-function pauseGame() { if (!G || G.over) return; G.paused = true; held.clear(); $('pauseMenu').classList.add('show'); }
+function pauseGame() { if (!G || G.over || (G.mode === 'online' && net.role === 'guest')) return; G.paused = true; held.clear(); $('pauseMenu').classList.add('show'); }
 function resumeGame() { if (!G) return; G.paused = false; $('pauseMenu').classList.remove('show'); lastFrame = performance.now(); }
 function toMenu() {
+  if (net.role !== 'offline') netClose(); onlineTeam = 0;
+  $('view0').appendChild(P[0].root); $('view1').appendChild(P[1].root);
   appState = 'menu'; newGame(); setLayout('ai'); renderHands(); hideOverlays(); $('menu').classList.add('show');
   UI.lastCrowns = ''; updateHUD(); renderMenuDeck(); renderTrophies();
   Music.stop(); Music.play(menuSong());
@@ -3706,7 +3946,7 @@ function toMenu() {
 function showEnd() {
   appState = 'ended';
   for (const p of P) closeEmotes(p.team);
-  const { winner, reason } = G.result, two = G.mode === '2p';
+  const { winner, reason } = G.result, two = G.mode === '2p' || G.mode === 'online';
   const title = $('endTitle');
   const name = t => two ? `Jugador ${t + 1}` : (t === 0 ? 'Tú' : 'El rival');
   if (two) {
@@ -3743,12 +3983,18 @@ function showEnd() {
   }
 }
 
+$('btnOnline').addEventListener('click', () => { $('menu').classList.remove('show'); $('onlineSetup').classList.add('show'); netStatus('Crea una sala o introduce el código de tu rival.'); });
+$('btnOnlineCreate').addEventListener('click', createOnlineRoom);
+$('btnOnlineJoin').addEventListener('click', joinOnlineRoom);
+$('btnOnlineBack').addEventListener('click', () => { netClose(); $('onlineSetup').classList.remove('show'); $('menu').classList.add('show'); $('btnOnlineCreate').disabled = false; $('btnOnlineJoin').disabled = false; $('onlineRoom').classList.add('hidden'); netStatus(''); });
+$('btnOnlineCopy').addEventListener('click', async () => { try { await navigator.clipboard.writeText($('onlineRoomCode').textContent); netStatus('Código copiado. ¡Compártelo con tu rival!'); } catch (_) { netStatus('Copia manualmente el código que aparece arriba.'); } });
+$('onlineCode').addEventListener('input', e => { e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6); });
 $('btnPlay').addEventListener('click', () => startGame('ai'));
 $('btnTwo').addEventListener('click', () => { $('menu').classList.remove('show'); $('twoSetup').classList.add('show'); });
 $('btnTwoStart').addEventListener('click', () => startGame('2p'));
 $('btnTwoBack').addEventListener('click', () => { $('twoSetup').classList.remove('show'); $('menu').classList.add('show'); });
-$('btnAgain').addEventListener('click', () => startGame());
-$('btnRestart').addEventListener('click', () => startGame());
+$('btnAgain').addEventListener('click', () => { if (G && G.mode === 'online') { if (net.role === 'host') startOnlineMatch('host'); else { appState = 'playing'; hideOverlays(); netSend({ type: 'rematch' }); } } else startGame(); });
+$('btnRestart').addEventListener('click', () => { if (G && G.mode === 'online') { if (net.role === 'host') startOnlineMatch('host'); else { appState = 'playing'; hideOverlays(); netSend({ type: 'rematch' }); } } else startGame(); });
 $('btnResume').addEventListener('click', resumeGame);
 $('btnQuit').addEventListener('click', toMenu);
 $('btnEndMenu').addEventListener('click', toMenu);
@@ -3835,12 +4081,13 @@ function frame(now) {
   let dt = (now - lastFrame) / 1000; lastFrame = now;
   if (dt > 0.1) dt = 0.1;
   try {
-    if (G && appState !== 'menu' && !G.paused) {
+    if (G && appState !== 'menu' && !G.paused && !(G.mode === 'online' && net.role === 'guest')) {
       acc += dt * SPEED;
       let steps = 0;
       while (acc >= STEP && steps < 40) { update(STEP); acc -= STEP; steps++; }
       if (steps >= 40) acc = 0;
     }
+    if (net.role === 'host' && now - net.lastSync > 80) { net.lastSync = now; netBroadcast(); }
     updateCursors(dt);
     render(dt);
     updateHUD();
